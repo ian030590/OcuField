@@ -60,6 +60,7 @@ def test_timing_invalid_attempts_never_reach_scoring(monkeypatch, outcomes, expe
         close=lambda: None, central=(None,),
     )
     monkeypatch.setattr(experiment, 'Display', lambda *_: display)
+    monkeypatch.setattr(experiment, 'verify_pixels', lambda _: None)
     monkeypatch.setattr(experiment, 'monitor_refresh_hz', lambda hwnd: {123: 120}[hwnd])
     real_update = experiment.update_staircase
 

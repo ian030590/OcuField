@@ -28,6 +28,10 @@ class Aborted(Exception):
     pass
 
 
+class GraphicsCheckError(RuntimeError):
+    pass
+
+
 @contextmanager
 def runtime(scratch_dir=None):
     with TemporaryDirectory(prefix='ocufield-', dir=scratch_dir) as scratch:
@@ -313,8 +317,7 @@ def run_experiment(visual, config, *, fullscreen=True, scripted=False, size=(192
         display_type = HiddenSelfTestDisplay if hidden_test else Display
         display = display_type(window, fullscreen)
         resources.callback(display.close)
-        if scripted:
-            verify_pixels(display)
+        verify_pixels(display)
         geometry = calculate_screen_geometry(
             config['screenWidthCm'], config['screenHeightCm'], config['viewingDistanceCm'],
             config['targetVisualAngleDeg'], config['vehicleVisualAngleDeg'], display.size,
@@ -375,21 +378,58 @@ def run_experiment(visual, config, *, fullscreen=True, scripted=False, size=(192
 
 def verify_pixels(display):
     from PIL import Image
-    from pyglet import gl
 
-    w, h = display.size
-    pattern = np.zeros((h, w), dtype=np.uint8)
-    pattern[:h // 2, 1::2] = 255
-    pattern[h // 2:, ::2] = 255
-    with ExitStack() as resources:
-        draw = display.prepare(Image.fromarray(pattern), resources)
-        draw()
-        pixels = (gl.GLubyte * (w * h * 3))()
-        gl.glPixelStorei(gl.GL_PACK_ALIGNMENT, 1)
-        gl.glReadPixels(0, 0, w, h, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, pixels)
-        actual = np.ctypeslib.as_array(pixels).reshape(h, w, 3)[::-1]
-        if not np.all(actual == pattern[:, :, None]):
-            raise RuntimeError('二元遮罩未能逐像素對齊')
+    info = dict.fromkeys(('GL_VENDOR', 'GL_RENDERER', 'GL_VERSION'))
+    try:
+        from pyglet import gl
+
+        for _ in range(32):
+            if gl.glGetError() == gl.GL_NO_ERROR:
+                break
+        else:
+            raise RuntimeError('OpenGL errors did not clear before the pixel check')
+
+        metadata_error = None
+        for name in info:
+            try:
+                value = gl.glGetString(getattr(gl, name))
+                if value:
+                    info[name] = ctypes.string_at(value).decode('utf-8', errors='replace').strip()
+            except Exception as error:
+                metadata_error = error
+        if not all(info.values()):
+            raise RuntimeError('OpenGL identification unavailable') from metadata_error
+
+        gl.glDrawBuffer(gl.GL_BACK)
+        try:
+            gl.glReadBuffer(gl.GL_BACK)
+            w, h = display.size
+            pattern = np.zeros((h, w), dtype=np.uint8)
+            pattern[:h // 2, 1::2] = 255
+            pattern[h // 2:, ::2] = 255
+            with ExitStack() as resources:
+                draw = display.prepare(Image.fromarray(pattern), resources)
+                draw()
+                pixels = (gl.GLubyte * (w * h * 3))()
+                gl.glPushClientAttrib(gl.GL_CLIENT_PIXEL_STORE_BIT)
+                try:
+                    gl.glPixelStorei(gl.GL_PACK_ALIGNMENT, 1)
+                    gl.glReadPixels(0, 0, w, h, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, pixels)
+                finally:
+                    gl.glPopClientAttrib()
+                actual = np.ctypeslib.as_array(pixels).reshape(h, w, 3)[::-1]
+                if not np.all(actual == pattern[:, :, None]):
+                    raise RuntimeError('OpenGL pixel readback did not match the test pattern')
+        finally:
+            gl.glClear(gl.GL_COLOR_BUFFER_BIT)
+        if gl.glGetError() != gl.GL_NO_ERROR:
+            raise RuntimeError('OpenGL reported an error during the pixel check')
+    except Exception as error:
+        details = ' / '.join(f'{name}={value or "無法讀取"}' for name, value in info.items())
+        raise GraphicsCheckError(
+            'GRAPHICS_CHECK_FAILED 顯示卡驅動／繪圖環境無法正確呈現刺激，已停止施測，未產生資料。\n'
+            + details
+        ) from error
 
 
 def self_test(visual, directory, *, verify_timing=True):
